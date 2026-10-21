@@ -1,29 +1,15 @@
-
-# tkinter: biblioteca estándar de Python para crear interfaces gráficas.
-#   Viene incluida con Python; no necesita instalación separada.
-#   filedialog: para abrir el cuadro "Seleccionar archivo"
-#   messagebox: para mostrar ventanas de error o confirmación
-#   scrolledtext: cuadro de texto con barra de desplazamiento (para la demo)
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, ttk
 
-# os.path: para extraer el nombre de archivo de una ruta completa
+# threading: corre la compresión en un hilo separado para que
+# la barra de progreso pueda animarse mientras trabaja
+import threading
 import os
-
-# io y contextlib: para capturar lo que motor.demo() imprime en consola
-#   y mostrarlo en la ventana gráfica en vez de la terminal
 import io
 import contextlib
-
-# motor: importamos TODO el motor de compresión.
-#   La GUI solo usa: motor.comprimir(), motor.descomprimir(), motor.demo()
 import motor
 
-
-# ══════════════════════════════════════════════════════════════════════
-# CONSTANTES DE ESTILO
-# ══════════════════════════════════════════════════════════════════════
-
+#Colores de la interfaz
 AZUL_OSCURO = "#1F3864"     # color del texto principal
 AZUL_MEDIO  = "#2E75B6"     # color de los títulos
 GRIS_CLARO  = "#F5F5F5"     # fondo de las secciones
@@ -33,56 +19,39 @@ FUENTE      = ("Segoe UI", 10)
 FUENTE_MONO = ("Courier New", 9)
 
 
-# ══════════════════════════════════════════════════════════════════════
 # VENTANA PRINCIPAL
-# ══════════════════════════════════════════════════════════════════════
-
 class App:
-    """
-    La ventana principal del programa.
-
-    ¿POR QUÉ UNA CLASE?
-        Usando una clase podemos guardar estado entre clicks
-        (por ejemplo, recordar qué archivo se seleccionó para comprimir,
-        y usarlo cuando el usuario hace click en "Descomprimir").
-        Sin la clase, necesitaríamos variables globales (más desordenado).
-    """
-
     def __init__(self, raiz):
-        """
-        Construye la ventana: título, secciones, botones y etiquetas.
-        raiz: la ventana de tkinter (tk.Tk()) que nos pasarán desde main().
-        """
         self.raiz = raiz
         self.raiz.title("Compresor Matricial MTXC")
         self.raiz.geometry("580x520")
         self.raiz.resizable(False, False)
         self.raiz.configure(bg="white")
 
-        # ── ESTADO INTERNO ────────────────────────────────────────
+        #ESTADO INTERNO 
         # Guardamos las rutas para usarlas entre operaciones
         self.rutas_originales = []    # archivos que el usuario seleccionó
         self.ruta_mtxc        = None  # .mtxc resultado de comprimir
 
-        # ── CONSTRUCCIÓN DE LA INTERFAZ ───────────────────────────
+        #INTERFAZ 
         self._seccion_titulo()
         self._seccion_archivos()
         self._seccion_botones()
+        self._seccion_progreso()
         self._seccion_resultados()
         self._seccion_demo()
 
+#Encabezado
     def _seccion_titulo(self):
-        """Encabezado con el nombre del proyecto."""
         marco = tk.Frame(self.raiz, bg=AZUL_OSCURO, height=60)
         marco.pack(fill="x")
         tk.Label(marco,
-                 text="Compresor Matricial MTXC  ·  Y = A·X (mod 256)",
+                 text="Compresor Matricial",
                  bg=AZUL_OSCURO, fg="white",
                  font=("Segoe UI", 12, "bold")
                  ).pack(pady=15)
 
     def _seccion_archivos(self):
-        """Sección donde se muestran los archivos seleccionados."""
         marco = tk.LabelFrame(self.raiz, text="Archivos",
                                bg="white", fg=AZUL_OSCURO,
                                font=("Segoe UI", 9, "bold"), padx=8, pady=6)
@@ -95,44 +64,49 @@ class App:
         self.lbl_archivos.pack(fill="x")
 
     def _seccion_botones(self):
-        """Fila de botones de acción."""
         marco = tk.Frame(self.raiz, bg="white", pady=8)
         marco.pack(fill="x", padx=12)
 
         estilo = {"font": FUENTE, "padx": 12, "pady": 6, "cursor": "hand2"}
 
-        # Seleccionar archivo(s): abre el cuadro de diálogo de selección
-        tk.Button(marco, text="📂  Seleccionar archivo(s)",
-                  command=self.accion_seleccionar,
-                  bg=AZUL_OSCURO, fg="white", **estilo
-                  ).pack(side="left", padx=(0, 6))
+        b1 = tk.Button(marco, text="Seleccionar archivos",
+                       command=self.accion_seleccionar,
+                       bg=AZUL_OSCURO, fg="white", **estilo)
+        b1.pack(side="left", padx=(0, 6))
 
-        # Comprimir: llama a motor.comprimir() con los archivos seleccionados
-        tk.Button(marco, text="⬇  Comprimir",
-                  command=self.accion_comprimir,
-                  bg=AZUL_MEDIO, fg="white", **estilo
-                  ).pack(side="left", padx=(0, 6))
+        b2 = tk.Button(marco, text="Comprimir",
+                       command=self.accion_comprimir,
+                       bg=AZUL_MEDIO, fg="white", **estilo)
+        b2.pack(side="left", padx=(0, 6))
 
-        # Descomprimir: abre un .mtxc y llama a motor.descomprimir()
-        tk.Button(marco, text="⬆  Descomprimir",
-                  command=self.accion_descomprimir,
-                  bg=AZUL_MEDIO, fg="white", **estilo
-                  ).pack(side="left", padx=(0, 6))
+        b3 = tk.Button(marco, text="Descomprimir",
+                       command=self.accion_descomprimir,
+                       bg=AZUL_MEDIO, fg="white", **estilo)
+        b3.pack(side="left", padx=(0, 6))
+      
 
-        # Demo: muestra las matrices en una ventana aparte
-        tk.Button(marco, text="📐  Demo N=4",
-                  command=self.accion_demo,
-                  bg="#555", fg="white", **estilo
-                  ).pack(side="left")
+        # guardar referencias para poder deshabilitarlos mientras trabaja
+        self._botones = [b1, b2, b3]
+
+    def _seccion_progreso(self):
+        marco = tk.Frame(self.raiz, bg="white")
+        marco.pack(fill="x", padx=12, pady=(4, 0))
+
+        self.barra = ttk.Progressbar(marco, mode="indeterminate", length=520)
+        self.barra.pack(fill="x")
+
+        self.lbl_estado = tk.Label(marco, text="", bg="white",
+                                   fg="#555", font=("Segoe UI", 8))
+        self.lbl_estado.pack(anchor="w", pady=(1, 0))
 
     def _seccion_resultados(self):
-        """Sección donde se muestran las estadísticas de la última operación."""
+        """Sección donde se muestran las estadísticas de la última operación"""
         marco = tk.LabelFrame(self.raiz, text="Resultados",
                                bg="white", fg=AZUL_OSCURO,
                                font=("Segoe UI", 9, "bold"), padx=8, pady=6)
         marco.pack(fill="x", padx=12, pady=(4, 0))
 
-        # etiquetas de estadísticas (se actualizan después de comprimir)
+        # etiquetas de estadísticas (se actualizan después de comprimir
         self.lbl_modo       = self._etiqueta_stat(marco, "Modo detectado:")
         self.lbl_original   = self._etiqueta_stat(marco, "Tamaño original:")
         self.lbl_comprimido = self._etiqueta_stat(marco, "Tamaño comprimido:")
@@ -144,10 +118,6 @@ class App:
         self.lbl_integridad.pack(fill="x", pady=4)
 
     def _etiqueta_stat(self, padre, texto_fijo):
-        """
-        [Auxiliar] Crea un par "Label fijo: Label variable" en una fila.
-        El label variable se actualiza con los resultados.
-        """
         fila = tk.Frame(padre, bg="white")
         fila.pack(fill="x", pady=1)
         tk.Label(fila, text=texto_fijo, bg="white", fg=AZUL_OSCURO,
@@ -156,71 +126,55 @@ class App:
         var.pack(side="left")
         return var
 
-    def _seccion_demo(self):
-        """Pie de la ventana con atajo rápido a la demo."""
-        pie = tk.Frame(self.raiz, bg=GRIS_CLARO, height=30)
-        pie.pack(fill="x", side="bottom")
-        tk.Label(pie,
-                 text="Tip: 'Demo N=4' muestra las matrices D1 y D1⁻¹ con un ejemplo a mano",
-                 bg=GRIS_CLARO, fg="#777", font=("Segoe UI", 8)
-                 ).pack(pady=6)
 
-    # ══════════════════════════════════════════════════════════════
-    # ACCIONES (conectadas a los botones)
-    # ══════════════════════════════════════════════════════════════
-
+# ACCIONES (conectadas a los botones)
     def accion_seleccionar(self):
-        """
-        Abre el cuadro de diálogo para seleccionar uno o más archivos.
-        Acepta cualquier tipo de archivo.
-        """
+#Abre el cuadro de diálogo para seleccionar uno o más archivos.Acepta cualquier tipo de archivo
         rutas = filedialog.askopenfilenames(
             title="Seleccionar archivo(s) para comprimir",
             filetypes=[("Todos los archivos", "*.*")]
         )
         if not rutas:
-            return    # el usuario canceló
+            return    # el usuario cancelo
 
         self.rutas_originales = list(rutas)
         self.ruta_mtxc        = None    # limpiar .mtxc anterior
 
-        # mostrar los nombres de archivos seleccionados (no la ruta completa)
+        # mostrar los nombres de archivos seleccionados
         nombres = ", ".join(os.path.basename(r) for r in rutas)
         self.lbl_archivos.config(text=nombres)
         self._limpiar_resultados()
 
     def accion_comprimir(self):
-        """
-        Comprime los archivos seleccionados.
-        Llama a motor.comprimir() y muestra los resultados.
-        """
+        #Comprime los archivos seleccionados en un hilo separado La barra de progreso se anima mientras trabaja
         if not self.rutas_originales:
             messagebox.showwarning("Sin archivos",
-                                   "Primero selecciona al menos un archivo.")
+                                   "Primero selecciona al menos un archivo")
             return
-
-        # determinar ruta de salida (.mtxc)
-        base          = os.path.splitext(self.rutas_originales[0])[0]
+        
+        base           = os.path.splitext(self.rutas_originales[0])[0]
         self.ruta_mtxc = base + ".mtxc"
+        self._iniciar_progreso("Comprimiendo…")
 
-        # mostrar cursor de espera mientras trabaja
-        self.raiz.config(cursor="watch")
-        self.raiz.update()
+        def trabajo():
+            try:
+                stats = motor.comprimir(self.rutas_originales, self.ruta_mtxc)
+                # after() programa la actualización en el hilo principal de tkinter
+                self.raiz.after(0, lambda: self._fin_comprimir(stats))
+            except Exception as e:
+                self.raiz.after(0, lambda: self._fin_error("Error al comprimir", str(e)))
 
-        try:
-            # toda la matemática ocurre en este llamado
-            stats = motor.comprimir(self.rutas_originales, self.ruta_mtxc)
-            self._mostrar_stats_compresion(stats)
-        except Exception as e:
-            messagebox.showerror("Error al comprimir", str(e))
-        finally:
-            self.raiz.config(cursor="")    # restaurar cursor
+        threading.Thread(target=trabajo, daemon=True).start()
+
+    def _fin_comprimir(self, stats):
+        #Ejecutado en el hilo principal cuando la compresión termina
+        self._detener_progreso()
+        self._mostrar_stats_compresion(stats)
 
     def accion_descomprimir(self):
-        """
-        Abre un cuadro de diálogo para seleccionar un .mtxc y lo descomprime.
-        Verifica la integridad si el archivo original también está disponible.
-        """
+        
+        #Descomprime un .mtxc en un hilo separado.La barra de progreso se anima mientras trabaja.
+        
         ruta_mtxc = filedialog.askopenfilename(
             title="Seleccionar archivo .mtxc para descomprimir",
             filetypes=[("Archivos MTXC", "*.mtxc"), ("Todos", "*.*")]
@@ -232,61 +186,53 @@ class App:
         if not carpeta:
             return
 
-        self.raiz.config(cursor="watch")
-        self.raiz.update()
+        self._iniciar_progreso("Descomprimiendo…")
 
-        try:
-            # toda la matemática inversa ocurre en este llamado
-            rutas_generadas = motor.descomprimir(ruta_mtxc, carpeta)
-            self._mostrar_resultado_descompresion(rutas_generadas)
-        except Exception as e:
-            messagebox.showerror("Error al descomprimir", str(e))
-        finally:
-            self.raiz.config(cursor="")
+        def trabajo():
+            try:
+                rutas = motor.descomprimir(ruta_mtxc, carpeta)
+                self.raiz.after(0, lambda: self._fin_descomprimir(rutas))
+            except Exception as e:
+                self.raiz.after(0, lambda: self._fin_error("Error al descomprimir", str(e)))
 
-    def accion_demo(self):
-        """
-        Abre una nueva ventana con el demo de matrices (N=4).
-        Captura la salida de motor.demo() y la muestra en un cuadro de texto.
-        """
-        # capturar lo que motor.demo() imprimiría en la terminal
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            motor.demo(4)
-        texto_demo = buffer.getvalue()
+        threading.Thread(target=trabajo, daemon=True).start()
 
-        # crear ventana emergente
-        ventana = tk.Toplevel(self.raiz)
-        ventana.title("Demo de matrices (N=4)")
-        ventana.geometry("560x420")
-        ventana.configure(bg="white")
+    def _fin_descomprimir(self, rutas_generadas):
+        #Ejecutado en el hilo principal cuando la descompresión termina
+        self._detener_progreso()
+        self._mostrar_resultado_descompresion(rutas_generadas)
 
-        tk.Label(ventana,
-                 text="Matrices D1 y D1⁻¹  ·  Ejemplo Y=D1·x  ·  Verificación D1·D1⁻¹=I",
-                 bg=AZUL_OSCURO, fg="white", font=("Segoe UI", 9, "bold")
-                 ).pack(fill="x", pady=0)
+    
+    #progreso
+    def _iniciar_progreso(self, texto):
+    #inicia la barra animada y deshabilita los botones
+        self.lbl_estado.config(text=texto)
+        self.barra.start(12)
+        for b in self._botones:
+            b.config(state="disabled")
 
-        # cuadro de texto con la salida del demo
-        txt = scrolledtext.ScrolledText(ventana, font=FUENTE_MONO,
-                                         bg="#f8f9fa", wrap="none",
-                                         padx=10, pady=10)
-        txt.pack(fill="both", expand=True, padx=8, pady=8)
-        txt.insert("1.0", texto_demo)
-        txt.config(state="disabled")    # solo lectura
+    def _detener_progreso(self):
+        #etiene la barra y reactiva los botones
+        self.barra.stop()
+        self.lbl_estado.config(text="")
+        for b in self._botones:
+            b.config(state="normal")
 
-    # ══════════════════════════════════════════════════════════════
-    # HELPERS DE VISUALIZACIÓN
-    # ══════════════════════════════════════════════════════════════
+    def _fin_error(self, titulo, mensaje):
+        self._detener_progreso()
+        messagebox.showerror(titulo, mensaje)
 
+
+    #visualizacion
     def _limpiar_resultados(self):
-        """Resetea todas las etiquetas de resultados a "—"."""
+        #resetea todas las etiquetas de resultados a "—"."""
         for lbl in (self.lbl_modo, self.lbl_original, self.lbl_comprimido,
                     self.lbl_reduccion, self.lbl_matriz):
             lbl.config(text="—", fg="#333")
         self.lbl_integridad.config(text="Reconstrucción: —", fg="#555")
 
     def _mostrar_stats_compresion(self, stats):
-        """Actualiza las etiquetas con los resultados de la compresión."""
+        #actualiza las etiquetas con los resultados de la compresión."""
         MODOS = {0: "vacío", 1: "genérico (1D)",
                  2: "imagen BMP 2D", 3: "paquete de archivos"}
 
@@ -338,11 +284,6 @@ class App:
             "Listo",
             "Archivos reconstruidos:\n" + "\n".join(os.path.basename(r) for r in rutas)
         )
-
-
-# ══════════════════════════════════════════════════════════════════════
-# PUNTO DE ENTRADA
-# ══════════════════════════════════════════════════════════════════════
 
 def main():
     """

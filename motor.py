@@ -4,12 +4,13 @@ import numpy as np
 import os
 from pathlib import Path
 
+
+#Constantes, N = para que la transformacion tenga efecto, Matrix de 8x8, B = Fotos e imagenes jpge, pixeles por bloque
 N = 8
-
 B = 8
-
 FIRMA = b"MTXC"
 
+# Le dicen al descompresor qué tipo de datos tiene el archivo
 MODO_VACIO      = 0   # el archivo original estaba vacío
 MODO_GENERICO   = 1   # texto, PDF, exe, cualquier cosa que no sea BMP 24-bit
 MODO_IMAGEN     = 2   # imagen BMP 24-bit sin comprimir (transformación 2D)
@@ -17,16 +18,15 @@ MODO_PAQUETE    = 3   # varios archivos empacados en uno solo
 MODO_ALMACENADO = 4   # archivo guardado tal cual (comprimir lo agrandaba)
 
 
+#1 Matrices
 def construir_d1(n):
     D = np.eye(n, dtype=np.uint8)      # empieza como identidad
     for i in range(1, n):
         D[i, i - 1] = 255              # 255 = -1 mod 256, en la subdiagonal
     return D
 
-
 def construir_d1_inversa(n):
-    return np.tril(np.ones((n, n), dtype=np.uint8))
-
+     return np.tril(np.ones((n, n), dtype=np.uint8))
 
 def verificar_inversa(n):
     D     = construir_d1(n)
@@ -46,6 +46,13 @@ def aplicar_d1_2d(bloque, D):
 def desaplicar_d1_2d(bloque, D_inv):
     return D_inv @ bloque @ D_inv.T
 
+
+
+#2 BLOQUES
+"""Las matrices operan sobre vectores de tamaño N.
+Estas funciones convierten los bytes del archivo en vectores,
+y reconvierten los vectores a bytes al final."""
+
 def bytes_a_bloques(datos, n):
     L = len(datos)
     if L == 0:
@@ -61,6 +68,11 @@ def bloques_a_bytes(X, L):
     return X.T.reshape(-1)[:L].astype(np.uint8).tobytes()
 
 
+
+#3 Entropia
+"""La entropía de Shannon mide qué tan comprimible es una secuencia
+La usamos para decidir si D1 vale la pena en cada archivo concreto"""
+
 def entropia(valores):
     if len(valores) == 0:
         return 0.0
@@ -70,11 +82,18 @@ def entropia(valores):
     return float(-(p * np.log2(p)).sum())
 
 
+#4: HUFFMAN
+
+"""Huffman asigna códigos binarios de longitud variable a cada byte:
+   los bytes más frecuentes reciben los códigos más cortos
+   los menos frecuentes reciben los más largos
+ Esto reduce el tamaño real en bytes"""
+
 def _construir_codigos(frecuencias):
     if not frecuencias:
         return {}
     if len(frecuencias) == 1:
-        # caso especial: solo hay un tipo de byte → código "0"
+        # caso especial: solo hay un tipo de byte = código "0"
         return {list(frecuencias.keys())[0]: "0"}
 
     # el heap guarda: (frecuencia, id_único, símbolo_o_None, hijo_izq, hijo_der)
@@ -109,6 +128,21 @@ def _construir_codigos(frecuencias):
 
 
 def huffman_comprimir(valores):
+    """Comprime un array de bytes usando codificación de Huffman
+
+    PROCESO:
+        1. Contar cuántas veces aparece cada byte (frecuencias)
+        2. Construir el árbol y obtener los códigos
+        3. Empacar los bits en un bytearray usando un acumulador pequeño
+           que se vacía byte a byte (nunca crece más de ~30 bits)
+
+    POR QUÉ UN ACUMULADOR PEQUEÑO Y NO UN ENTERO GIGANTE:
+        Si acumulamos todos los bits en un solo entero Python, ese entero
+        puede llegar a tener millones de bits para archivos grandes, y las
+        operaciones de shift sobre él se vuelven cada vez más lentas (O(n**2)
+        en total). Con un buffer de bytes que se vacía byte a byte, el
+        acumulador nunca supera los 32 bits → cada operación es O(1)"""
+    
     if len(valores) == 0:
         return b"", 0, {}
 
@@ -150,6 +184,21 @@ def huffman_comprimir(valores):
 
 
 def huffman_descomprimir(empacado, relleno, frecuencias, total):
+    """Descomprime bytes comprimidos con huffman_comprimir()
+
+    VERSIÓN RÁPIDA: tabla de búsqueda + acumulador deslizante
+
+    CÓMO FUNCIONA:
+        Tabla de búsqueda: para cada posible bloque de K bits, la tabla
+        guarda qué símbolo corresponde y cuántos bits consume. Un acceso
+        a la tabla reemplaza recorrer el árbol bit a bit
+
+        Acumulador deslizante: en vez de convertir todos los bytes
+        comprimidos en un entero gigante, leemos el archivo comprimido
+        de a un byte, manteniendo un acumulador que nunca supera ~24 bits
+        Esto garantiza O(1) por símbolo y O(n) en total
+
+    total: cuántos bytes hay que producir (guardado en el archivo)"""
     if total == 0:
         return np.array([], dtype=np.uint8)
 
@@ -246,8 +295,21 @@ def huffman_descomprimir(empacado, relleno, frecuencias, total):
 
     return salida[:idx]
 
-
+#5: Lector/Escritor BPM, Solo en imagenes
 def _leer_bmp(datos):
+    """[Interna] Lee un BMP de 24 bits sin comprimir (BI_RGB).
+
+    Retorna un dict con todos los campos del BMP, o None si el archivo
+    no es un BMP de 24 bits compatible
+
+    El dict contiene:
+        encabezado:   bytes originales del encabezado (se guardan verbatim)
+        ancho, alto:  dimensiones en píxeles
+        relleno_fila: bytes de padding por fila (BMP alinea a múltiplos de 4)
+        pad_datos:    los bytes de relleno reales (para reconstruir exacto)
+        canales:      lista [B, G, R] de matrices numpy uint8 (alto×ancho)
+        extra:        bytes tras los píxeles (normalmente vacío)
+    """
     if len(datos) < 54 or datos[:2] != b"BM":
         return None                                     # no es BMP
 
@@ -289,8 +351,7 @@ def _leer_bmp(datos):
         "relleno_fila": pad_f,
         "pad_datos":   bytes(pad_bytes),
         "canales":     canales,
-        "extra":       extra,
-    }
+        "extra":       extra,}
 
 
 def _escribir_bmp(info):
@@ -309,6 +370,9 @@ def _escribir_bmp(info):
 
     return info["encabezado"] + b"".join(filas) + info["extra"]
 
+
+#COMPRESOR CENTRAL
+"""Estas funciones unen las secciones 1-5 para comprimir y descomprimir"""
 
 def _comprimir_1d(datos):
 
@@ -334,6 +398,9 @@ def _comprimir_1d(datos):
 
 
 def _descomprimir_1d(r):
+    """
+    [Interna] Inversa de _comprimir_1d(). Recibe el dict del registro.
+    """
     vals = huffman_descomprimir(r["comprimido"], r["relleno"], r["frecuencias"], r["total"])
     M    = r["total"] // r["n"]
     Y    = vals.reshape(M, r["n"]).T    # reconstruir matriz de bloques
@@ -421,6 +488,8 @@ def _descomprimir_imagen(r, info_bmp_meta):
 
     return _escribir_bmp({**info_bmp_meta, "canales": canales})
 
+
+#7: FORMATO .mtxc
 # Definición del formato binario del archivo de salida.
 #
 # ESTRUCTURA GENERAL:
@@ -485,7 +554,19 @@ def _deserializar_registro(datos, pos=0):
             "relleno": relleno, "frecuencias": frec, "comprimido": comprimido}
 
 
+#API PÚBLICA
+
 def comprimir(rutas_entrada, ruta_salida):
+    """
+    Comprime uno o varios archivos a un único archivo .mtxc
+
+    MODO AUTOMÁTICO:
+         1 archivo BMP 24-bit sin comprimir = modo IMAGEN (D1 2D + Huffman)
+         1 archivo de cualquier otro tipo   = modo GENÉRICO (D1 1D + Huffman)
+         2 o más archivos                   = modo PAQUETE (genérico por archivo)
+
+    Retorna: dict con estadísticas para mostrar en la interfaz
+    """
     # normalizar: si se pasa una sola ruta como string, convertir a lista
     if isinstance(rutas_entrada, (str, Path)):
         rutas_entrada = [rutas_entrada]
@@ -605,7 +686,7 @@ def descomprimir(ruta_mtxc, carpeta_salida=None):
     os.makedirs(carpeta_salida, exist_ok=True)
     archivos_escritos = []
 
-    # ─── modo almacenado (sin compresión) ────────────────────────
+    #modo almacenado (sin compresión
     if modo == MODO_ALMACENADO:
         ext_len = cuerpo[0]
         ext     = cuerpo[1: 1 + ext_len].decode("utf-8", errors="replace")
@@ -615,13 +696,13 @@ def descomprimir(ruta_mtxc, carpeta_salida=None):
         ruta.write_bytes(datos)
         return [str(ruta)]
 
-    # ─── modo vacío ───────────────────────────────────────────────
+    #modo vacío
     if modo == MODO_VACIO:
         ruta = Path(carpeta_salida) / (Path(ruta_mtxc).stem + "_reconstruido.bin")
         ruta.write_bytes(b"")
         archivos_escritos.append(str(ruta))
 
-    # ─── modo genérico ────────────────────────────────────────────
+    #modo genérico
     elif modo == MODO_GENERICO:
         ext_len   = cuerpo[0]
         ext       = cuerpo[1: 1 + ext_len].decode("utf-8", errors="replace")
@@ -632,7 +713,7 @@ def descomprimir(ruta_mtxc, carpeta_salida=None):
         ruta.write_bytes(recuperado)
         archivos_escritos.append(str(ruta))
 
-    # ─── modo imagen ──────────────────────────────────────────────
+    #modo imagen
     elif modo == MODO_IMAGEN:
         pos = 0
 
@@ -666,7 +747,7 @@ def descomprimir(ruta_mtxc, carpeta_salida=None):
         ruta.write_bytes(recuperado)
         archivos_escritos.append(str(ruta))
 
-    # ─── modo paquete ─────────────────────────────────────────────
+    #modo paquete
     elif modo == MODO_PAQUETE:
         pos       = 0
         num       = struct.unpack_from("<H", cuerpo, pos)[0]; pos += 2
