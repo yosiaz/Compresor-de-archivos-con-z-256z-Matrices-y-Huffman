@@ -39,7 +39,6 @@ class App:
         self._seccion_botones()
         self._seccion_progreso()
         self._seccion_resultados()
-        self._seccion_demo()
 
 #Encabezado
     def _seccion_titulo(self):
@@ -290,6 +289,7 @@ def main():
     Crea la ventana principal de tkinter y la pone a correr.
     mainloop() mantiene la ventana abierta esperando clics del usuario.
     """
+    motor.subir_prioridad()  # NUEVO — sube la prioridad del proceso una sola vez, antes de crear la ventana
     raiz = tk.Tk()
     App(raiz)                # construir la interfaz
     raiz.mainloop()          # esperar eventos (clics, teclas, cierre)
