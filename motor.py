@@ -4,6 +4,35 @@ import numpy as np
 import os
 from pathlib import Path
 
+# NUEVO — sys se usa en subir_prioridad() para detectar si el sistema es Windows
+import sys as _sys
+# NUEVO — gc permite pausar el recolector de basura mientras se comprime/descomprime
+import gc as _gc
+# NUEVO — ProcessPoolExecutor reparte archivos entre procesos (uno por núcleo) y evita el GIL
+# (para os.cpu_count() se reutiliza el "import os" que ya existía arriba)
+from concurrent.futures import ProcessPoolExecutor as _PPE
+
+
+# NUEVO — función que sube la prioridad del proceso para que el OS le dé más CPU
+def subir_prioridad():
+    """
+    Sube la prioridad del proceso al máximo permitido sin permisos de administrador.
+    En Windows usa SetPriorityClass (HIGH_PRIORITY_CLASS).
+    En Linux/Mac usa os.nice(-10) (en algunos sistemas requiere permisos extra).
+    Si falla silenciosamente, el programa sigue funcionando normal.
+    """
+    try:                                                    # NUEVO — nunca romper el programa por esto
+        if _sys.platform == "win32":                        # NUEVO — rama de Windows
+            import ctypes                                   # NUEVO — acceso a la API de Windows
+            # NUEVO — HIGH_PRIORITY_CLASS = 0x80, aplicada al proceso actual
+            ctypes.windll.kernel32.SetPriorityClass(
+                ctypes.windll.kernel32.GetCurrentProcess(), 0x80
+            )
+        else:                                               # NUEVO — rama de Linux/Mac
+            os.nice(-10)                                    # NUEVO — -10 = prioridad mayor
+    except Exception:
+        pass                                                # NUEVO — si no se puede, no pasa nada
+
 
 #Constantes, N = para que la transformacion tenga efecto, Matrix de 8x8, B = Fotos e imagenes jpge, pixeles por bloque
 N = 8
@@ -554,9 +583,22 @@ def _deserializar_registro(datos, pos=0):
             "relleno": relleno, "frecuencias": frec, "comprimido": comprimido}
 
 
+# NUEVO — función auxiliar a nivel de módulo (ProcessPoolExecutor necesita poder serializarla con pickle)
+def _comprimir_un_archivo(ruta_str):
+    """
+    Comprime un solo archivo y devuelve (nombre, registro_bytes).
+    Se ejecuta en un proceso hijo separado del proceso principal.
+    Llamada por comprimir() cuando hay varios archivos (MODO_PAQUETE).
+    """
+    ruta  = Path(ruta_str)                  # NUEVO — el hijo recibe la ruta como texto
+    datos = ruta.read_bytes()               # NUEVO — cada proceso lee su propio archivo
+    r     = _comprimir_1d(datos)            # NUEVO — misma lógica de siempre, sin cambios
+    return ruta.name, _serializar_registro(r)
+
+
 #API PÚBLICA
 
-def comprimir(rutas_entrada, ruta_salida):
+def _comprimir_sin_gc(rutas_entrada, ruta_salida):  # NUEVO — antes se llamaba comprimir(); ahora lo envuelve comprimir()
     """
     Comprime uno o varios archivos a un único archivo .mtxc
 
@@ -591,7 +633,8 @@ def comprimir(rutas_entrada, ruta_salida):
         modo = MODO_PAQUETE
 
     # construir el cuerpo del archivo según el modo
-    encabezado = FIRMA + struct.pack("<BB", modo)
+    # NUEVO — corrección: struct.pack("<BB") necesita 2 valores (versión y modo); faltaba la versión (1)
+    encabezado = FIRMA + struct.pack("<BB", 1, modo)
     stats      = {"modo": modo, "tam_original": tam_original}
 
     if modo == MODO_VACIO:
@@ -631,13 +674,17 @@ def comprimir(rutas_entrada, ruta_salida):
                       "h_sin": r_img["h_sin"], "h_con": r_img["h_con"]})
 
     else:  # MODO_PAQUETE
+        # NUEVO — comprimir cada archivo en un proceso separado (un núcleo por archivo)
+        n_workers = min(os.cpu_count() or 1, len(contenidos))   # NUEVO — nunca más procesos que archivos o núcleos
         partes = [struct.pack("<H", len(contenidos))]
-        for ruta, datos in zip(rutas_entrada, contenidos):
-            nombre   = ruta.name.encode("utf-8")
-            r        = _comprimir_1d(datos)
-            registro = _serializar_registro(r)
+        with _PPE(max_workers=n_workers) as pool:               # NUEVO — pool de procesos hijos
+            # NUEVO — pool.map conserva el orden original de los archivos
+            resultados = list(pool.map(_comprimir_un_archivo,
+                                       [str(r) for r in rutas_entrada]))
+        for nombre, registro in resultados:                     # NUEVO — armar el cuerpo igual que antes
+            nombre_b = nombre.encode("utf-8")
             partes.append(
-                struct.pack("<B", len(nombre)) + nombre +
+                struct.pack("<B", len(nombre_b)) + nombre_b +
                 struct.pack("<I", len(registro)) + registro
             )
         cuerpo = b"".join(partes)
@@ -650,7 +697,7 @@ def comprimir(rutas_entrada, ruta_salida):
     if modo not in (MODO_VACIO, MODO_PAQUETE) and len(contenido_final) >= tam_original + 6:
         ext             = (rutas_entrada[0].suffix or ".bin").encode("utf-8")
         contenido_final = (FIRMA
-                           + struct.pack("<BB", MODO_ALMACENADO)
+                           + struct.pack("<BB", 1, MODO_ALMACENADO)   # NUEVO — corrección: se añade el byte de versión (1)
                            + struct.pack("<B", len(ext)) + ext
                            + contenidos[0])          # bytes originales, sin tocar
         stats["almacenado"] = True
@@ -662,7 +709,7 @@ def comprimir(rutas_entrada, ruta_salida):
     return stats
 
 
-def descomprimir(ruta_mtxc, carpeta_salida=None):
+def _descomprimir_sin_gc(ruta_mtxc, carpeta_salida=None):  # NUEVO — antes se llamaba descomprimir(); ahora lo envuelve descomprimir()
     """
     Descomprime un archivo .mtxc y escribe los archivos originales.
 
@@ -779,3 +826,27 @@ def descomprimir(ruta_mtxc, carpeta_salida=None):
             archivos_escritos.append(str(ruta))
 
     return archivos_escritos
+
+
+# NUEVO — comprimir() público: pausa el GC durante todo el trabajo pesado y lo reactiva siempre
+def comprimir(rutas_entrada, ruta_salida):
+    """Misma función de siempre (ver _comprimir_sin_gc), pero con el GC pausado."""
+    gc_estaba_activo = _gc.isenabled()      # NUEVO — recordar el estado previo del GC
+    _gc.disable()                           # NUEVO — pausar el GC: evita pausas aleatorias en el loop de Huffman
+    try:
+        return _comprimir_sin_gc(rutas_entrada, ruta_salida)
+    finally:
+        if gc_estaba_activo:                # NUEVO — siempre reactivar, aunque haya error
+            _gc.enable()
+
+
+# NUEVO — descomprimir() público: igual, con el GC pausado durante _descomprimir_1d/_imagen/huffman_descomprimir
+def descomprimir(ruta_mtxc, carpeta_salida=None):
+    """Misma función de siempre (ver _descomprimir_sin_gc), pero con el GC pausado."""
+    gc_estaba_activo = _gc.isenabled()      # NUEVO — recordar el estado previo del GC
+    _gc.disable()                           # NUEVO — pausar el GC durante la descompresión
+    try:
+        return _descomprimir_sin_gc(ruta_mtxc, carpeta_salida)
+    finally:
+        if gc_estaba_activo:                # NUEVO — siempre reactivar, aunque haya error
+            _gc.enable()
