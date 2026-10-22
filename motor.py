@@ -955,7 +955,7 @@ def _descomprimir_sin_gc(ruta_mtxc, carpeta_salida=None, progreso=None):  # NUEV
         r         = _deserializar_registro(cuerpo[1 + ext_len:])
         recuperado = _descomprimir_1d(r)
         stem      = Path(ruta_mtxc).stem
-        ruta      = Path(carpeta_salida) / (stem + "_reconstruido" + ext)
+        ruta      = Path(carpeta_salida) / (stem + ext)
         ruta.write_bytes(recuperado)
         archivos_escritos.append(str(ruta))
 
