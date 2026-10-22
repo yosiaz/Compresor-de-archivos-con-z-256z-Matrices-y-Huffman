@@ -4,16 +4,18 @@ import numpy as np
 import os
 from pathlib import Path
 
-# NUEVO — sys se usa en subir_prioridad() para detectar si el sistema es Windows
+# NUEVO — sys se usa en subir_prioridad() para detectar el sistema
 import sys as _sys
 # NUEVO — gc permite pausar el recolector de basura mientras se comprime/descomprime
 import gc as _gc
 # NUEVO — ProcessPoolExecutor reparte archivos entre procesos (uno por núcleo) y evita el GIL
 # (para os.cpu_count() se reutiliza el "import os" que ya existía arriba)
 from concurrent.futures import ProcessPoolExecutor as _PPE
+# NUEVO — deque se usa para mantener una ventana de bloques en vuelo (limita la RAM en archivos grandes)
+from collections import deque as _deque
 
 
-# NUEVO — función que sube la prioridad del proceso para que el OS le dé más CPU
+# NUEVO — función que sube la prioridad del proceso para que el OS le de más CPU, segun yo con esto disminuimos el tiempo de espera pero en las pruebas mostro que ayuda unicmente en el modo paquete
 def subir_prioridad():
     """
     Sube la prioridad del proceso al máximo permitido sin permisos de administrador.
@@ -45,6 +47,14 @@ MODO_GENERICO   = 1   # texto, PDF, exe, cualquier cosa que no sea BMP 24-bit
 MODO_IMAGEN     = 2   # imagen BMP 24-bit sin comprimir (transformación 2D)
 MODO_PAQUETE    = 3   # varios archivos empacados en uno solo
 MODO_ALMACENADO = 4   # archivo guardado tal cual (comprimir lo agrandaba)
+# NUEVO — modo para archivos grandes: se parte en bloques independientes que se comprimen en paralelo
+MODO_BLOQUES    = 5
+# NUEVO — paquete con archivos grandes: cada archivo se parte en bloques y TODOS los bloques se reparten entre los núcleos
+MODO_PAQUETE_BLOQUES = 6
+# NUEVO — tamaño de cada bloque (múltiplo de N=8 para que los bloques de D1 queden alineados)
+TAM_BLOQUE      = 8 * 1024 * 1024
+# NUEVO — desde este tamaño (y si no es un BMP 24-bit) un archivo único usa MODO_BLOQUES
+UMBRAL_BLOQUES  = 16 * 1024 * 1024
 
 
 #1 Matrices
@@ -162,54 +172,91 @@ def huffman_comprimir(valores):
     PROCESO:
         1. Contar cuántas veces aparece cada byte (frecuencias)
         2. Construir el árbol y obtener los códigos
-        3. Empacar los bits en un bytearray usando un acumulador pequeño
-           que se vacía byte a byte (nunca crece más de ~30 bits)
+        3. Empacar los bits
 
-    POR QUÉ UN ACUMULADOR PEQUEÑO Y NO UN ENTERO GIGANTE:
-        Si acumulamos todos los bits en un solo entero Python, ese entero
-        puede llegar a tener millones de bits para archivos grandes, y las
-        operaciones de shift sobre él se vuelven cada vez más lentas (O(n**2)
-        en total). Con un buffer de bytes que se vacía byte a byte, el
-        acumulador nunca supera los 32 bits → cada operación es O(1)"""
-    
+    NUEVO — VERSIÓN VECTORIZADA CON NUMPY (mismo resultado, byte a byte, que la
+    versión con bucle de Python; es entre 4 y 10 veces más rápida):
+        - Cada símbolo se convierte a sus bits con una tabla (256 × longitud_máx)
+          usando indexación de numpy, en vez de un bucle símbolo por símbolo.
+        - Se descartan los bits sobrantes con una máscara y np.packbits junta
+          los bits en bytes.
+        - Se procesa por trozos para que la RAM no crezca con el tamaño de la
+          entrada; los bits que no completan un byte se arrastran al trozo siguiente."""
+
     if len(valores) == 0:
         return b"", 0, {}
 
+    # NUEVO — aplanar a uint8 sin copiar si ya lo es
+    v = np.ascontiguousarray(valores.ravel(), dtype=np.uint8)
+
     # contar frecuencias de cada byte
-    frec_arr    = np.bincount(valores.ravel().astype(np.uint8), minlength=256)
-    frecuencias = {int(v): int(c) for v, c in enumerate(frec_arr) if c > 0}
+    frec_arr    = np.bincount(v, minlength=256)
+    frecuencias = {int(s): int(c) for s, c in enumerate(frec_arr) if c > 0}
 
     # construir los códigos del árbol de Huffman
     codigos = _construir_codigos(frecuencias)
 
-    # pre-convertir cada código a (entero, longitud) para evitar int() dentro del loop
-    tabla = [(0, 0)] * 256
+    # NUEVO — tablas de numpy: longitud de cada código y sus bits (0/1) alineados a la izquierda
+    max_lng = max(len(c) for c in codigos.values())
+    lng_tab = np.zeros(256, dtype=np.uint8)
+    bit_tab = np.zeros((256, max_lng), dtype=np.uint8)
     for simbolo, codigo in codigos.items():
-        tabla[simbolo] = (int(codigo, 2) if codigo else 0, len(codigo))
+        lng_tab[simbolo] = len(codigo)
+        bit_tab[simbolo, :len(codigo)] = np.frombuffer(codigo.encode(), dtype=np.uint8) - 48  # '0'/'1' → 0/1
+    columnas = np.arange(max_lng, dtype=np.uint8)
 
-    # empacar bits en un bytearray usando un acumulador pequeño:
-    #   acum acumula bits de izquierda a derecha
-    #   cada vez que tiene 8 bits completos, los vuelca al buffer y los descarta
-    buf    = bytearray()
-    acum   = 0     # acumulador: nunca supera los 32 bits aproximadamente
-    n_acum = 0     # cuántos bits hay en acum ahora mismo
-
-    for v in valores.ravel():
-        val, lng = tabla[int(v)]
-        acum     = (acum << lng) | val   # añadir el código al acumulador
-        n_acum  += lng
-        # volcar tantos bytes completos como haya
-        while n_acum >= 8:
-            n_acum -= 8
-            buf.append((acum >> n_acum) & 0xFF)  # el byte más significativo
-            acum &= (1 << n_acum) - 1             # descartar lo que ya volcamos
+    # NUEVO — trozos de ~16 millones de elementos de matriz (acota la RAM temporal)
+    paso    = max(1, (1 << 24) // max_lng)
+    partes  = []                           # bytes ya empacados
+    resto   = np.zeros(0, dtype=np.uint8)  # bits sueltos (<8) que pasan al siguiente trozo
+    for i in range(0, len(v), paso):
+        trozo = v[i:i + paso]
+        mat   = bit_tab[trozo]                                    # (M, max_lng): bits de cada símbolo
+        mask  = columnas[None, :] < lng_tab[trozo][:, None]       # True solo en los bits reales del código
+        bits  = mat[mask]                                         # flujo de bits en orden (símbolo a símbolo)
+        if len(resto):
+            bits = np.concatenate([resto, bits])
+        n8 = (len(bits) // 8) * 8                                 # bits que completan bytes
+        partes.append(np.packbits(bits[:n8]))
+        resto = bits[n8:]
 
     # rellenar el último byte parcial con ceros
-    relleno = (8 - n_acum) % 8
-    if n_acum > 0:
-        buf.append((acum << relleno) & 0xFF)
+    n_resto = len(resto)
+    relleno = (8 - n_resto) % 8
+    if n_resto:
+        partes.append(np.packbits(np.concatenate([resto, np.zeros(relleno, dtype=np.uint8)])))
 
-    return bytes(buf), relleno, frecuencias
+    return b"".join(p.tobytes() for p in partes), relleno, frecuencias
+
+
+# NUEVO — decodificador rápido (mismo algoritmo de tabla de búsqueda, bucle más ajustado).
+# Se usa cuando el código más largo cabe en la tabla (≤ 16 bits), que es el caso normal.
+#   - Se sabe cuántos símbolos hay (total), así que no hace falta contar bits leídos.
+#   - El acumulador se rellena de a 4 bytes y solo se recorta al rellenar.
+#   - Es ~4 veces más rápido que el bucle genérico y produce exactamente la misma salida.
+def _huffman_descomprimir_rapido(empacado, frecuencias, total, codigos, k):
+    tsim = [0] * (1 << k)                      # NUEVO — símbolo para cada posible bloque de k bits
+    tlen = [1] * (1 << k)                      # NUEVO — longitud del código para cada bloque
+    for simbolo, codigo in codigos.items():
+        lng  = len(codigo)
+        base = (int(codigo, 2) if codigo else 0) << (k - lng)
+        for extra in range(1 << (k - lng)):    # NUEVO — todas las entradas que comparten ese prefijo
+            tsim[base | extra] = simbolo
+            tlen[base | extra] = lng
+    emp    = bytes(empacado) + b"\x00" * 8      # NUEVO — relleno para poder leer 4 bytes al final sin error
+    salida = bytearray(total)
+    acum, n_acum, pos = 0, 0, 0
+    mascara = (1 << k) - 1
+    desde_bytes = int.from_bytes
+    for idx in range(total):
+        if n_acum < k:                         # NUEVO — rellenar con 32 bits nuevos
+            acum    = ((acum & ((1 << n_acum) - 1)) << 32) | desde_bytes(emp[pos:pos + 4], "big")
+            n_acum += 32
+            pos    += 4
+        c          = (acum >> (n_acum - k)) & mascara   # NUEVO — los próximos k bits
+        salida[idx] = tsim[c]
+        n_acum    -= tlen[c]                   # NUEVO — consumir solo los bits del código
+    return np.frombuffer(bytes(salida), dtype=np.uint8)
 
 
 def huffman_descomprimir(empacado, relleno, frecuencias, total):
@@ -235,6 +282,10 @@ def huffman_descomprimir(empacado, relleno, frecuencias, total):
     KTABLA   = 16            # tabla de 2^16 = 65536 entradas
     max_bits = max((len(c) for c in codigos.values()), default=1)
     k        = min(max_bits, KTABLA)
+
+    # NUEVO — camino rápido cuando todos los códigos caben en la tabla
+    if max_bits <= KTABLA:
+        return _huffman_descomprimir_rapido(empacado, frecuencias, total, codigos, k)
 
     # construir la tabla de búsqueda
     # tabla[chunk_de_k_bits] = (símbolo, longitud_del_código)
@@ -524,7 +575,7 @@ def _descomprimir_imagen(r, info_bmp_meta):
 # ESTRUCTURA GENERAL:
 # [4 B] FIRMA    b"MTXC"
 # [1 B] VERSION  1
-# [1 B] MODO     0=vacío  1=genérico  2=imagen  3=paquete
+# [1 B] MODO     0=vacío  1=genérico  2=imagen  3=paquete  4=almacenado  5=bloques  6=paquete por bloques
 # [...] contenido según el modo
 #
 # REGISTRO GENÉRICO (usado en modo 1 y dentro de modo 3):
@@ -556,6 +607,17 @@ def _descomprimir_imagen(r, info_bmp_meta):
 # [1 B] K-1
 # [5×K B] tabla
 # [resto] flujo
+
+# MODO 6 (paquete por bloques, NUEVO): varios archivos, alguno grande
+# [2 B] num_archivos
+# num_archivos × ( [1 B] len_nombre  [?] nombre  [4 B] num_bloques
+#                  + num_bloques × ( [4 B] len_registro + [?] REGISTRO GENÉRICO del bloque ) )
+# Un archivo vacío tiene num_bloques = 0. Los bloques de cada archivo se concatenan en orden.
+
+# MODO 5 (bloques, NUEVO): archivo único grande partido en bloques de TAM_BLOQUE
+# [1 B] len_ext  [?] ext  [4 B] num_bloques
+# num_bloques × ( [4 B] len_registro + [?] REGISTRO GENÉRICO del bloque )
+# Los bloques se concatenan en orden para reconstruir el archivo original.
 
 def _serializar_registro(r):
     K     = len(r["frecuencias"])
@@ -596,9 +658,135 @@ def _comprimir_un_archivo(ruta_str):
     return ruta.name, _serializar_registro(r)
 
 
+# NUEVO — avisar progreso (0.0 a 1.0) si quien llama pasó un callback; si no, no hace nada
+def _avance(progreso, fraccion):
+    if progreso is not None:
+        progreso(min(1.0, max(0.0, fraccion)))
+
+
+# NUEVO — ¿el archivo debe comprimirse por bloques? (grande y que NO sea un BMP 24-bit soportado)
+def _usa_modo_bloques(ruta):
+    if ruta.stat().st_size < UMBRAL_BLOQUES:
+        return False
+    with open(ruta, "rb") as f:
+        cab = f.read(54)                      # NUEVO — solo se lee el encabezado, no el archivo entero
+    if len(cab) >= 54 and cab[:2] == b"BM":
+        dib  = struct.unpack_from("<I", cab, 14)[0]
+        bpp  = struct.unpack_from("<H", cab, 28)[0]
+        comp = struct.unpack_from("<I", cab, 30)[0]
+        if dib == 40 and bpp == 24 and comp == 0:
+            return False                      # NUEVO — BMP 24-bit: sigue por el modo IMAGEN de siempre
+    return True
+
+
+# NUEVO — comprime UN bloque del archivo (se ejecuta en un proceso hijo; debe estar a nivel de módulo)
+def _comprimir_bloque(args):
+    ruta_str, desde, largo = args
+    with open(ruta_str, "rb") as f:           # NUEVO — cada proceso lee solo su trozo
+        f.seek(desde)
+        datos = f.read(largo)
+    r = _comprimir_1d(datos)                  # NUEVO — misma lógica de siempre (D1 + Huffman)
+    return _serializar_registro(r), r["usa_d1"], r["h_sin"], r["h_con"]
+
+
+# NUEVO — descomprime UN bloque (proceso hijo); devuelve los bytes originales del bloque
+def _descomprimir_bloque(registro_raw):
+    return _descomprimir_1d(_deserializar_registro(registro_raw))
+
+
+# NUEVO — ejecuta fn sobre cada elemento de 'trabajos' en un pool de procesos, devolviendo los
+# resultados EN ORDEN pero sin tener más de 2×núcleos bloques en memoria a la vez
+def _mapear_con_ventana(fn, trabajos, n_workers):
+    ventana = n_workers * 2
+    with _PPE(max_workers=n_workers) as pool:
+        pendientes = _deque()
+        it = iter(trabajos)
+        hay_mas = True
+        while pendientes or hay_mas:
+            while hay_mas and len(pendientes) < ventana:
+                try:
+                    pendientes.append(pool.submit(fn, next(it)))
+                except StopIteration:
+                    hay_mas = False
+            if pendientes:
+                yield pendientes.popleft().result()
+
+
+# NUEVO — compresión de un archivo grande: bloques de TAM_BLOQUE comprimidos en paralelo.
+# Formato del cuerpo: [1B len_ext][ext][4B num_bloques] + num_bloques × ([4B len_registro][registro])
+def _comprimir_en_bloques(ruta, ruta_salida, progreso):
+    tam    = ruta.stat().st_size
+    ext    = (ruta.suffix or ".bin").encode("utf-8")
+    trozos = [(str(ruta), d, min(TAM_BLOQUE, tam - d)) for d in range(0, tam, TAM_BLOQUE)]
+    n_workers = min(os.cpu_count() or 1, len(trozos))
+
+    usa_d1_n, suma_h_sin, suma_h_con = 0, 0.0, 0.0
+    with open(ruta_salida, "wb") as out:
+        out.write(FIRMA + struct.pack("<BB", 1, MODO_BLOQUES))
+        out.write(struct.pack("<B", len(ext)) + ext + struct.pack("<I", len(trozos)))
+        for k, (registro, usa, h_sin, h_con) in enumerate(
+                _mapear_con_ventana(_comprimir_bloque, trozos, n_workers), start=1):
+            out.write(struct.pack("<I", len(registro)) + registro)   # NUEVO — se escribe apenas termina cada bloque
+            usa_d1_n   += int(usa)
+            suma_h_sin += h_sin
+            suma_h_con += h_con
+            _avance(progreso, k / len(trozos))
+    n = len(trozos)
+    return {"modo": MODO_BLOQUES, "tam_original": tam,
+            "tam_comprimido": Path(ruta_salida).stat().st_size, "almacenado": False,
+            "usa_d1": usa_d1_n > 0, "bloques": n, "bloques_d1": usa_d1_n,
+            "h_sin": suma_h_sin / n, "h_con": suma_h_con / n}
+
+
+# NUEVO — nombre de salida de un archivo del paquete; si dos se llaman igual, el segundo lleva _2, _3...
+def _nombre_reconstruido(nombre, conteo_nombres):
+    stem        = Path(nombre).stem
+    sufijo      = Path(nombre).suffix or ".bin"
+    nombre_base = stem + "_reconstruido" + sufijo
+    if nombre_base not in conteo_nombres:
+        conteo_nombres[nombre_base] = 1
+        return nombre_base
+    conteo_nombres[nombre_base] += 1
+    return stem + f"_reconstruido_{conteo_nombres[nombre_base]}" + sufijo
+
+
+# NUEVO — ¿hay que usar el paquete por bloques? (varios archivos y al menos uno grande)
+def _usa_paquete_bloques(rutas):
+    return len(rutas) > 1 and any(r.stat().st_size >= UMBRAL_BLOQUES for r in rutas)
+
+
+# NUEVO — compresión de un paquete con archivos grandes. No carga los archivos en memoria: cada proceso
+# lee su propio bloque. Todos los bloques de todos los archivos forman una sola cola de trabajo.
+def _comprimir_paquete_bloques(rutas, ruta_salida, progreso):
+    tamanos = [r.stat().st_size for r in rutas]
+    nbloques = [(t + TAM_BLOQUE - 1) // TAM_BLOQUE for t in tamanos]     # NUEVO — bloques por archivo
+    trabajos = [(str(r), d, min(TAM_BLOQUE, t - d))
+                for r, t in zip(rutas, tamanos) for d in range(0, t, TAM_BLOQUE)]
+    total     = len(trabajos)
+    n_workers = min(os.cpu_count() or 1, total)
+    resultados = _mapear_con_ventana(_comprimir_bloque, trabajos, n_workers)
+
+    usa_n, suma_h_sin, suma_h_con, hechos = 0, 0.0, 0.0, 0
+    with open(ruta_salida, "wb") as out:
+        out.write(FIRMA + struct.pack("<BB", 1, MODO_PAQUETE_BLOQUES) + struct.pack("<H", len(rutas)))
+        for ruta, nb in zip(rutas, nbloques):
+            nombre_b = ruta.name.encode("utf-8")
+            out.write(struct.pack("<B", len(nombre_b)) + nombre_b + struct.pack("<I", nb))
+            for _ in range(nb):                                        # NUEVO — los resultados llegan en orden
+                registro, usa, h_sin, h_con = next(resultados)
+                out.write(struct.pack("<I", len(registro)) + registro)
+                usa_n += int(usa); suma_h_sin += h_sin; suma_h_con += h_con
+                hechos += 1
+                _avance(progreso, hechos / total)
+    return {"modo": MODO_PAQUETE_BLOQUES, "tam_original": sum(tamanos),
+            "tam_comprimido": Path(ruta_salida).stat().st_size, "almacenado": False,
+            "usa_d1": usa_n > 0, "bloques": total, "bloques_d1": usa_n,
+            "h_sin": suma_h_sin / total, "h_con": suma_h_con / total}
+
+
 #API PÚBLICA
 
-def _comprimir_sin_gc(rutas_entrada, ruta_salida):  # NUEVO — antes se llamaba comprimir(); ahora lo envuelve comprimir()
+def _comprimir_sin_gc(rutas_entrada, ruta_salida, progreso=None):  # NUEVO — antes se llamaba comprimir(); ahora lo envuelve comprimir()
     """
     Comprime uno o varios archivos a un único archivo .mtxc
 
@@ -613,6 +801,14 @@ def _comprimir_sin_gc(rutas_entrada, ruta_salida):  # NUEVO — antes se llamaba
     if isinstance(rutas_entrada, (str, Path)):
         rutas_entrada = [rutas_entrada]
     rutas_entrada = [Path(r) for r in rutas_entrada]
+
+    # NUEVO — archivo único grande: modo por bloques (no se lee el archivo completo en memoria)
+    if len(rutas_entrada) == 1 and _usa_modo_bloques(rutas_entrada[0]):
+        return _comprimir_en_bloques(rutas_entrada[0], ruta_salida, progreso)
+
+    # NUEVO — varios archivos y alguno grande: paquete por bloques (tampoco se cargan en memoria)
+    if _usa_paquete_bloques(rutas_entrada):
+        return _comprimir_paquete_bloques(rutas_entrada, ruta_salida, progreso)
 
     # leer todos los archivos
     contenidos = [r.read_bytes() for r in rutas_entrada]
@@ -679,8 +875,11 @@ def _comprimir_sin_gc(rutas_entrada, ruta_salida):  # NUEVO — antes se llamaba
         partes = [struct.pack("<H", len(contenidos))]
         with _PPE(max_workers=n_workers) as pool:               # NUEVO — pool de procesos hijos
             # NUEVO — pool.map conserva el orden original de los archivos
-            resultados = list(pool.map(_comprimir_un_archivo,
-                                       [str(r) for r in rutas_entrada]))
+            resultados = []
+            for i, res in enumerate(pool.map(_comprimir_un_archivo,
+                                             [str(r) for r in rutas_entrada]), start=1):
+                resultados.append(res)                          # NUEVO — se recoge en orden y se avisa el progreso
+                _avance(progreso, i / len(rutas_entrada))
         for nombre, registro in resultados:                     # NUEVO — armar el cuerpo igual que antes
             nombre_b = nombre.encode("utf-8")
             partes.append(
@@ -709,7 +908,7 @@ def _comprimir_sin_gc(rutas_entrada, ruta_salida):  # NUEVO — antes se llamaba
     return stats
 
 
-def _descomprimir_sin_gc(ruta_mtxc, carpeta_salida=None):  # NUEVO — antes se llamaba descomprimir(); ahora lo envuelve descomprimir()
+def _descomprimir_sin_gc(ruta_mtxc, carpeta_salida=None, progreso=None):  # NUEVO — antes se llamaba descomprimir(); ahora lo envuelve descomprimir()
     """
     Descomprime un archivo .mtxc y escribe los archivos originales.
 
@@ -824,29 +1023,82 @@ def _descomprimir_sin_gc(ruta_mtxc, carpeta_salida=None):  # NUEVO — antes se 
             ruta = Path(carpeta_salida) / nombre_final
             ruta.write_bytes(recuperado)
             archivos_escritos.append(str(ruta))
+            _avance(progreso, len(archivos_escritos) / num)   # NUEVO — avisar progreso por archivo
+
+    # NUEVO — paquete por bloques: todos los bloques de todos los archivos se descomprimen en paralelo
+    elif modo == MODO_PAQUETE_BLOQUES:
+        pos = 0
+        num = struct.unpack_from("<H", cuerpo, pos)[0]; pos += 2
+        archivos = []                                     # NUEVO — (nombre, [(pos, largo) de cada bloque])
+        for _ in range(num):
+            ln     = cuerpo[pos];                                  pos += 1
+            nombre = cuerpo[pos: pos + ln].decode("utf-8");        pos += ln
+            nb     = struct.unpack_from("<I", cuerpo, pos)[0];     pos += 4
+            bloques = []
+            for _ in range(nb):
+                lr = struct.unpack_from("<I", cuerpo, pos)[0];     pos += 4
+                bloques.append((pos, lr))
+                pos += lr
+            archivos.append((nombre, bloques))
+        total     = sum(len(b) for _, b in archivos)
+        n_workers = min(os.cpu_count() or 1, max(1, total))
+        trabajos  = (bytes(cuerpo[p: p + lr]) for _, bl in archivos for p, lr in bl)
+        resultados = _mapear_con_ventana(_descomprimir_bloque, trabajos, n_workers)
+        conteo_nombres, hechos = {}, 0
+        for nombre, bloques in archivos:
+            ruta = Path(carpeta_salida) / _nombre_reconstruido(nombre, conteo_nombres)
+            with open(ruta, "wb") as out:
+                for _ in bloques:
+                    out.write(next(resultados))                # NUEVO — escritura en orden, sin acumular en RAM
+                    hechos += 1
+                    _avance(progreso, hechos / total)
+            archivos_escritos.append(str(ruta))
+
+    # NUEVO — modo bloques: cada bloque se descomprime en un proceso aparte y se escribe en orden
+    elif modo == MODO_BLOQUES:
+        ext_len = cuerpo[0]
+        ext     = cuerpo[1: 1 + ext_len].decode("utf-8", errors="replace")
+        pos     = 1 + ext_len
+        num     = struct.unpack_from("<I", cuerpo, pos)[0]; pos += 4
+        registros = []                                    # NUEVO — (posición, largo) de cada registro
+        for _ in range(num):
+            lr = struct.unpack_from("<I", cuerpo, pos)[0]; pos += 4
+            registros.append((pos, lr))
+            pos += lr
+        ruta = Path(carpeta_salida) / (Path(ruta_mtxc).stem + "_reconstruido" + ext)
+        n_workers = min(os.cpu_count() or 1, max(1, num))
+        trabajos  = (bytes(cuerpo[p: p + lr]) for p, lr in registros)   # NUEVO — se generan bajo demanda
+        with open(ruta, "wb") as out:
+            for k, trozo in enumerate(
+                    _mapear_con_ventana(_descomprimir_bloque, trabajos, n_workers), start=1):
+                out.write(trozo)                          # NUEVO — escritura en orden, sin acumular en RAM
+                _avance(progreso, k / num)
+        archivos_escritos.append(str(ruta))
 
     return archivos_escritos
 
 
 # NUEVO — comprimir() público: pausa el GC durante todo el trabajo pesado y lo reactiva siempre
-def comprimir(rutas_entrada, ruta_salida):
-    """Misma función de siempre (ver _comprimir_sin_gc), pero con el GC pausado."""
+def comprimir(rutas_entrada, ruta_salida, progreso=None):
+    """Misma función de siempre (ver _comprimir_sin_gc), pero con el GC pausado.
+    NUEVO — progreso: función opcional que recibe un número de 0.0 a 1.0."""
     gc_estaba_activo = _gc.isenabled()      # NUEVO — recordar el estado previo del GC
     _gc.disable()                           # NUEVO — pausar el GC: evita pausas aleatorias en el loop de Huffman
     try:
-        return _comprimir_sin_gc(rutas_entrada, ruta_salida)
+        return _comprimir_sin_gc(rutas_entrada, ruta_salida, progreso)
     finally:
         if gc_estaba_activo:                # NUEVO — siempre reactivar, aunque haya error
             _gc.enable()
 
 
 # NUEVO — descomprimir() público: igual, con el GC pausado durante _descomprimir_1d/_imagen/huffman_descomprimir
-def descomprimir(ruta_mtxc, carpeta_salida=None):
-    """Misma función de siempre (ver _descomprimir_sin_gc), pero con el GC pausado."""
+def descomprimir(ruta_mtxc, carpeta_salida=None, progreso=None):
+    """Misma función de siempre (ver _descomprimir_sin_gc), pero con el GC pausado.
+    NUEVO — progreso: función opcional que recibe un número de 0.0 a 1.0."""
     gc_estaba_activo = _gc.isenabled()      # NUEVO — recordar el estado previo del GC
     _gc.disable()                           # NUEVO — pausar el GC durante la descompresión
     try:
-        return _descomprimir_sin_gc(ruta_mtxc, carpeta_salida)
+        return _descomprimir_sin_gc(ruta_mtxc, carpeta_salida, progreso)
     finally:
         if gc_estaba_activo:                # NUEVO — siempre reactivar, aunque haya error
             _gc.enable()

@@ -1,9 +1,11 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-# threading: corre la compresión en un hilo separado para que
-# la barra de progreso pueda animarse mientras trabaja
-import threading
+# NUEVO — multiprocessing: la compresión corre en un PROCESO aparte (no en un hilo). Un hilo comparte
+# el GIL con la ventana y, durante los bucles pesados, la congelaba; un proceso tiene su propio GIL.
+import multiprocessing
+# NUEVO — queue.Empty se usa al leer mensajes del proceso de trabajo sin bloquear la ventana
+import queue
 import os
 import io
 import contextlib
@@ -17,6 +19,20 @@ VERDE       = "#1a7f37"     # color de "RECONSTRUCCIÓN CORRECTA"
 ROJO        = "#c0392b"     # color de errores
 FUENTE      = ("Segoe UI", 10)
 FUENTE_MONO = ("Courier New", 9)
+
+
+# NUEVO — función que corre en el proceso de trabajo. Debe estar a nivel de módulo (requisito de "spawn").
+# Envía mensajes a la ventana por la cola: ("progreso", 0..1), ("ok", resultado) o ("error", texto)
+def _trabajo_proceso(operacion, args, cola):
+    try:
+        avisar = lambda fraccion: cola.put(("progreso", fraccion))   # NUEVO — callback de progreso para motor.py
+        if operacion == "comprimir":
+            resultado = motor.comprimir(args[0], args[1], progreso=avisar)
+        else:
+            resultado = motor.descomprimir(args[0], args[1], progreso=avisar)
+        cola.put(("ok", resultado))
+    except Exception as e:
+        cola.put(("error", str(e)))
 
 
 # VENTANA PRINCIPAL
@@ -33,12 +49,22 @@ class App:
         self.rutas_originales = []    # archivos que el usuario seleccionó
         self.ruta_mtxc        = None  # .mtxc resultado de comprimir
 
+        # NUEVO — estado del proceso de trabajo
+        self._ctx        = multiprocessing.get_context("spawn")  # NUEVO — "spawn" es seguro junto a tkinter
+        self.proceso     = None    # NUEVO — proceso de trabajo en curso (o None)
+        self.cola        = None    # NUEVO — cola por donde el proceso avisa progreso y resultado
+        self._al_terminar = None   # NUEVO — función a llamar con el resultado
+        self._titulo_error = ""    # NUEVO — título de la ventana de error
+        self._texto_base  = ""     # NUEVO — texto de estado ("Comprimiendo…")
+        self.raiz.protocol("WM_DELETE_WINDOW", self._al_cerrar)  # NUEVO — cerrar limpio si hay trabajo en curso
+
         #INTERFAZ 
         self._seccion_titulo()
         self._seccion_archivos()
         self._seccion_botones()
         self._seccion_progreso()
         self._seccion_resultados()
+        # NUEVO — corrección: se quitó self._seccion_demo(); ese método no existe en el archivo y la ventana fallaba al abrir
 
 #Encabezado
     def _seccion_titulo(self):
@@ -154,16 +180,9 @@ class App:
         base           = os.path.splitext(self.rutas_originales[0])[0]
         self.ruta_mtxc = base + ".mtxc"
         self._iniciar_progreso("Comprimiendo…")
-
-        def trabajo():
-            try:
-                stats = motor.comprimir(self.rutas_originales, self.ruta_mtxc)
-                # after() programa la actualización en el hilo principal de tkinter
-                self.raiz.after(0, lambda: self._fin_comprimir(stats))
-            except Exception as e:
-                self.raiz.after(0, lambda: self._fin_error("Error al comprimir", str(e)))
-
-        threading.Thread(target=trabajo, daemon=True).start()
+        # NUEVO — en vez de un hilo, se lanza un proceso aparte
+        self._lanzar("comprimir", (self.rutas_originales, self.ruta_mtxc),
+                     self._fin_comprimir, "Error al comprimir")
 
     def _fin_comprimir(self, stats):
         #Ejecutado en el hilo principal cuando la compresión termina
@@ -186,15 +205,9 @@ class App:
             return
 
         self._iniciar_progreso("Descomprimiendo…")
-
-        def trabajo():
-            try:
-                rutas = motor.descomprimir(ruta_mtxc, carpeta)
-                self.raiz.after(0, lambda: self._fin_descomprimir(rutas))
-            except Exception as e:
-                self.raiz.after(0, lambda: self._fin_error("Error al descomprimir", str(e)))
-
-        threading.Thread(target=trabajo, daemon=True).start()
+        # NUEVO — en vez de un hilo, se lanza un proceso aparte
+        self._lanzar("descomprimir", (ruta_mtxc, carpeta),
+                     self._fin_descomprimir, "Error al descomprimir")
 
     def _fin_descomprimir(self, rutas_generadas):
         #Ejecutado en el hilo principal cuando la descompresión termina
@@ -205,7 +218,10 @@ class App:
     #progreso
     def _iniciar_progreso(self, texto):
     #inicia la barra animada y deshabilita los botones
+        self._texto_base = texto                       # NUEVO — se recuerda para mostrar el porcentaje
         self.lbl_estado.config(text=texto)
+        self.barra.config(mode="indeterminate")        # NUEVO — empieza animada hasta recibir el primer % real
+        self.barra["value"] = 0
         self.barra.start(12)
         for b in self._botones:
             b.config(state="disabled")
@@ -213,9 +229,69 @@ class App:
     def _detener_progreso(self):
         #etiene la barra y reactiva los botones
         self.barra.stop()
+        self.barra.config(mode="indeterminate")        # NUEVO — dejar la barra lista para la próxima operación
+        self.barra["value"] = 0
         self.lbl_estado.config(text="")
         for b in self._botones:
             b.config(state="normal")
+
+    # NUEVO — lanza el proceso de trabajo y empieza a revisar su cola cada 100 ms
+    def _lanzar(self, operacion, args, al_terminar, titulo_error):
+        self.cola          = self._ctx.Queue()
+        self._al_terminar  = al_terminar
+        self._titulo_error = titulo_error
+        # NUEVO — daemon=False porque motor.py crea sus propios procesos hijos (pool) y un daemon no puede
+        self.proceso = self._ctx.Process(target=_trabajo_proceso,
+                                         args=(operacion, args, self.cola), daemon=False)
+        self.proceso.start()
+        self.raiz.after(100, self._revisar_cola)
+
+    # NUEVO — pasa a barra con porcentaje real cuando llega el primer aviso de progreso
+    def _actualizar_progreso(self, fraccion):
+        if str(self.barra.cget("mode")) != "determinate":
+            self.barra.stop()
+            self.barra.config(mode="determinate", maximum=100)
+        self.barra["value"] = fraccion * 100
+        self.lbl_estado.config(text=f"{self._texto_base} {fraccion * 100:.0f}%")
+
+    # NUEVO — lee los mensajes del proceso sin bloquear la ventana
+    def _revisar_cola(self):
+        final = None
+        try:
+            while final is None:
+                tipo, dato = self.cola.get_nowait()
+                if tipo == "progreso":
+                    self._actualizar_progreso(dato)
+                else:
+                    final = (tipo, dato)
+        except queue.Empty:
+            pass
+
+        if final is None and self.proceso is not None and not self.proceso.is_alive():
+            # NUEVO — el proceso terminó: dar una última oportunidad a un mensaje aún en tránsito
+            try:
+                tipo, dato = self.cola.get(timeout=0.5)
+                final = (tipo, dato) if tipo != "progreso" else ("error", "El proceso terminó sin resultado.")
+            except queue.Empty:
+                final = ("error", "El proceso de trabajo terminó inesperadamente.")
+
+        if final is None:
+            self.raiz.after(100, self._revisar_cola)    # NUEVO — seguir revisando
+            return
+
+        tipo, dato = final
+        self.proceso.join(timeout=2)
+        self.proceso, self.cola = None, None
+        if tipo == "ok":
+            self._al_terminar(dato)
+        else:
+            self._fin_error(self._titulo_error, dato)
+
+    # NUEVO — al cerrar la ventana, detener el trabajo en curso
+    def _al_cerrar(self):
+        if self.proceso is not None and self.proceso.is_alive():
+            self.proceso.terminate()
+        self.raiz.destroy()
 
     def _fin_error(self, titulo, mensaje):
         self._detener_progreso()
@@ -233,7 +309,9 @@ class App:
     def _mostrar_stats_compresion(self, stats):
         #actualiza las etiquetas con los resultados de la compresión."""
         MODOS = {0: "vacío", 1: "genérico (1D)",
-                 2: "imagen BMP 2D", 3: "paquete de archivos"}
+                 2: "imagen BMP 2D", 3: "paquete de archivos",
+                 5: "archivo grande por bloques (paralelo)",   # NUEVO — modo de bloques
+                 6: "paquete grande por bloques (paralelo)"}   # NUEVO — paquete por bloques
 
         tam_o = stats["tam_original"]
         tam_c = stats["tam_comprimido"]
@@ -250,7 +328,11 @@ class App:
                 self.lbl_reduccion.config(text=f"−{red:.1f}%", fg=VERDE)
 
         # información de la transformación matricial
-        if "usa_d1" in stats:
+        if stats.get("bloques"):                        # NUEVO — resumen para el modo por bloques
+            self.lbl_matriz.config(
+                text=f"D1 en {stats['bloques_d1']} de {stats['bloques']} bloques "
+                     f"(H prom.: {stats['h_sin']:.2f}→{stats['h_con']:.2f} bits/byte)")
+        elif "usa_d1" in stats:
             if stats["usa_d1"]:
                 self.lbl_matriz.config(
                     text=f"D1 aplicada (H: {stats['h_sin']:.2f}→{stats['h_con']:.2f} bits/byte)")
@@ -289,6 +371,7 @@ def main():
     Crea la ventana principal de tkinter y la pone a correr.
     mainloop() mantiene la ventana abierta esperando clics del usuario.
     """
+    multiprocessing.freeze_support()  # NUEVO — necesario si algún día se empaqueta como .exe (PyInstaller)
     motor.subir_prioridad()  # NUEVO — sube la prioridad del proceso una sola vez, antes de crear la ventana
     raiz = tk.Tk()
     App(raiz)                # construir la interfaz
